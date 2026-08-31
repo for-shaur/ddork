@@ -11,11 +11,12 @@ from ..net import normalize_domain, retry
 from ..concurrency import AdaptiveLimiter
 from .distill import get_distill_competitors
 from .spyfu import get_spyfu_competitors
-
+from .owler import get_owler_competitors
 # (provider_fn, short_label_for_logs)
 PROVIDERS = [
     (get_spyfu_competitors, "S"),
     (get_distill_competitors, "D"),
+    (get_owler_competitors, "O"),
 ]
 
 
