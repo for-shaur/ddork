@@ -6,7 +6,7 @@ import time
 from functools import lru_cache
 from urllib.parse import unquote as uq
 from urllib.parse import urlparse as up
-
+import tldextract
 from curl_cffi import requests as rq
 
 from .config import USER_AGENTS
@@ -81,6 +81,16 @@ def resolve_ddg_redirect(u):
                 return uq(pt[5:])
     return u
 
+def to_registrable_domain(hostname):
+    """Collapse a hostname to its registrable domain (eTLD+1), e.g.
+    'foo.bar.co.uk' -> 'bar.co.uk'. Uses tldextract's public suffix list
+    for correctness on multi-part TLDs. Returns None on junk input."""
+    if not hostname:
+        return None
+    ext = tldextract.extract(hostname)
+    if not ext.domain or not ext.suffix:
+        return None
+    return f"{ext.domain}.{ext.suffix}"
 
 class GlobalRateLimiter:
     """Token-bucket-style pacing: schedules a fixed interval between requests instead of just

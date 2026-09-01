@@ -12,11 +12,13 @@ from ..concurrency import AdaptiveLimiter
 from .distill import get_distill_competitors
 from .spyfu import get_spyfu_competitors
 from .owler import get_owler_competitors
+from .wappy import get_wappalyzer_competitors
 # (provider_fn, short_label_for_logs)
 PROVIDERS = [
     (get_spyfu_competitors, "S"),
     (get_distill_competitors, "D"),
     (get_owler_competitors, "O"),
+    (get_wappalyzer_competitors, "W"),
 ]
 
 
@@ -43,11 +45,53 @@ def find_competitors(domain, seen, lock, limiter, ui=None):
                 ui.checkpoint(f"enumeration  {label} {domain} err: {e}", ok=False)
     return found
 
+# --- competitors/enumerate.py ---
+def enumerate_domains(seed_domain, workers, delay, min_targets, ui=None):
+    """BFS out from `seed_domain`, expanding level by level with no depth cap,
+    until `min_targets` total domains are found or the frontier naturally runs
+    dry. On hitting min_targets mid-level, in-flight futures finish but no new
+    ones are submitted and remaining queued futures are cancelled."""
+    seed = normalize_domain(seed_domain)
+    if not seed:
+        log.error("enumerate_domains: empty seed domain")
+        return []
 
-def enumerate_domains(seed_domain, depth, workers, delay, ui=None):
-    """BFS out from `seed_domain` for `depth` levels. `workers` is a hard ceiling; actual
-    concurrency is self-tuned within it by the shared AdaptiveLimiter, which persists
-    across depth levels so it keeps adapting as the frontier grows."""
+    seen, frontier = {seed}, {seed}
+    limiter = AdaptiveLimiter(max_permits=workers, min_interval=delay)
+    level = 0
+    while frontier:
+        level += 1
+        log.info(f"Depth {level}: Scanning {len(frontier)} domains (permits: {limiter.permits}/{limiter.max_permits})")
+        next_frontier, lock = set(), th.Lock()
+        hit_cap = False
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(find_competitors, d, seen, lock, limiter, ui): d for d in frontier}
+            for f in cf.as_completed(futures):
+                next_frontier.update(f.result())
+                if ui:
+                    ui.status(f"enumerating  depth {level} · {len(seen)}/{min_targets} targets found")
+                if len(seen) >= min_targets:
+                    hit_cap = True
+                    ex.shutdown(cancel_futures=True)
+                    break
+        frontier = next_frontier
+        seen.update(frontier)
+        log.info(f"Depth {level}: found {len(next_frontier)} new targets (total unique so far: {len(seen)})")
+        if ui:
+            ui.checkpoint(f"enumeration  depth {level} → {len(next_frontier)} new targets ({len(seen)} total)")
+        if hit_cap:
+            log.info(f"Hit min_targets={min_targets}, stopping enumeration early at depth {level}")
+            if ui:
+                ui.checkpoint(f"enumeration  stopped early: reached max targets ({min_targets})")
+            break
+
+    log.info(f"Enumeration complete: {len(seen)} total targets across {level} depth(s)")
+    return sorted(seen)
+    
+    """BFS out from `seed_domain` for `depth` levels, or until `min_targets` total
+    domains are found, whichever comes first. On hitting min_targets mid-level,
+    in-flight futures are left to finish but no new ones are submitted, and the
+    executor cancels whatever's still queued."""
     seed = normalize_domain(seed_domain)
     if not seed:
         log.error("enumerate_domains: empty seed domain")
@@ -60,17 +104,27 @@ def enumerate_domains(seed_domain, depth, workers, delay, ui=None):
             break
         log.info(f"Depth {level}: Scanning {len(frontier)} domains (permits: {limiter.permits}/{limiter.max_permits})")
         next_frontier, lock = set(), th.Lock()
+        hit_cap = False
         with cf.ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {ex.submit(find_competitors, d, seen, lock, limiter, ui): d for d in frontier}
             for f in cf.as_completed(futures):
                 next_frontier.update(f.result())
                 if ui:
                     ui.status(f"enumerating  depth {level}/{depth} · {len(seen)} targets found")
+                if min_targets and len(seen) >= min_targets:
+                    hit_cap = True
+                    ex.shutdown(cancel_futures=True)  # ponytail: drop unstarted work, let in-flight finish
+                    break
         frontier = next_frontier
         seen.update(frontier)
         log.info(f"Depth {level}: found {len(next_frontier)} new targets (total unique so far: {len(seen)})")
         if ui:
             ui.checkpoint(f"enumeration  depth {level}/{depth} → {len(next_frontier)} new targets ({len(seen)} total)")
+        if hit_cap:
+            log.info(f"Hit min_targets={min_targets}, stopping enumeration early at depth {level}")
+            if ui:
+                ui.checkpoint(f"enumeration  stopped early: reached max targets ({min_targets})")
+            break
 
     log.info(f"Enumeration complete: {len(seen)} total targets across {depth} depth(s)")
     return sorted(seen)
