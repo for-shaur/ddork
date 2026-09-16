@@ -21,3 +21,6 @@ dist/
 .vscode/
 .idea/
 *.swp
+*.tsv
+*.txt
+*.sqlite

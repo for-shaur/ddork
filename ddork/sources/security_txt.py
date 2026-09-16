@@ -1,35 +1,59 @@
-"""Look up a domain's security.txt (RFC 9116) file for a disclosure/bounty policy URL."""
-import asyncio as aio
+"""Look up a domain's security.txt (RFC 9116). Returns dict with:
+found, source_url, policy_url, snippet (short), body (full text).
+
+Every HTTP call goes through the shared AIMD limiter so global request concurrency is
+capped regardless of how many domains run concurrently.
+
+v3.1: uses the shared per-thread session from net.get_session() so we don't pay
+TCP+TLS setup on every candidate path.
+"""
 import re
 
-from curl_cffi import requests as rq
+from ..config import log
+from ..net import get_session, gated_sync
 
-from ..config import IMPERSONATE, log
-from ..net import retry_async
-
-# Includes the legacy top-level /security.txt (plenty of sites still only have that one),
-# plus a cheap "contact:" sanity check so a 200-OK WAF/CDN block page isn't scored as "found".
 CANDIDATE_PATHS = (
     "https://{d}/.well-known/security.txt",
     "https://www.{d}/.well-known/security.txt",
     "https://{d}/security.txt",
 )
 
-PGP_BLOCK_RE = re.compile(r'-----BEGIN PGP SIGNED MESSAGE-----.*?-----END PGP SIGNATURE-----', re.S)
+PGP_BLOCK_RE = re.compile(
+    r'-----BEGIN PGP SIGNED MESSAGE-----.*?-----END PGP SIGNATURE-----', re.S
+)
+
+_EMPTY = {"found": False, "source_url": None, "policy_url": None,
+          "snippet": None, "body": None}
 
 
-async def check_security_txt(domain, tries=2):
+def _fetch(u):
+    try:
+        r = get_session().get(u, timeout=8)
+    except Exception:
+        return None
+    if r.status_code != 200 or "contact:" not in r.text.lower():
+        return None
+    return r.text
+
+
+async def check_security_txt(domain, limiter):
     for u in (p.format(d=domain) for p in CANDIDATE_PATHS):
-        try:
-            log.info(f"[SEC] Try {u}")
-            r = await retry_async(lambda u=u: aio.to_thread(rq.get, u, impersonate=IMPERSONATE, timeout=8), tries=tries)
-            log.info(f"[SEC] {u} -> {r.status_code}")
-            if r.status_code == 200 and "contact:" in r.text.lower():
-                t = PGP_BLOCK_RE.sub('', r.text)
-                policy = next((l.split(":", 1)[1].strip() for l in t.splitlines() if l.lower().startswith("policy:")), None)
-                log.info(f"[SEC] {domain} policy: {policy}")
-                return {"found": True, "source_url": u, "policy_url": policy, "snippet": t[:400]}
-        except Exception as e:
-            log.error(f"[SEC] {u} err: {e}")
+        text = await gated_sync(limiter, _fetch, u, domain=domain)
+        if not text:
+            continue
+        body = PGP_BLOCK_RE.sub('', text).strip()
+        policy = next(
+            (l.split(":", 1)[1].strip()
+             for l in body.splitlines() if l.lower().startswith("policy:")),
+            None,
+        )
+        log.info(f"[SEC] {domain} policy: {policy}")
+        return {
+            "found": True,
+            "source_url": u,
+            "policy_url": policy,
+            "snippet": body[:400],
+            "body": body,
+        }
     log.info(f"[SEC] {domain} not found")
-    return {"found": False, "source_url": None, "policy_url": None, "snippet": None}
+    return dict(_EMPTY)

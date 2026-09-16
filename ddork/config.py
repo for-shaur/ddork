@@ -8,13 +8,37 @@ log = lg.getLogger("scan")
 def configure_logging(debug):
     """Call once, early, from cli.main().
 
-    --debug: today's behavior — full stream+file logging, no live UI.
+    --debug: full stream+file logging, no live UI.
     default: file-only logging; stdout is owned by ui.ScanUI instead.
+
+    All handlers write UTF-8. Windows' default cp1252 crashes on any non-Latin-1
+    character in a logged URL (seen in the wild: an emoji inside a DDG result URL),
+    which takes down the whole process because logging's default error path is to
+    print a traceback and keep going — but the traceback itself prints to the same
+    broken stream, so the run dies.
     """
-    handlers = [lg.FileHandler("scan.log")]
+    _reconfigure_std_streams()
+
+    handlers = [lg.FileHandler("scan.log", encoding="utf-8")]
     if debug:
         handlers.append(lg.StreamHandler(sys.stdout))
-    lg.basicConfig(level=lg.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=handlers, force=True)
+
+    lg.basicConfig(
+        level=lg.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+
+
+def _reconfigure_std_streams():
+    """Force UTF-8 on stdout/stderr. No-op where reconfigure isn't supported
+    (e.g. when the stream is already wrapped by something that isn't a TextIOWrapper)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
 
 # --- Fallback user agents (used if the remote UA endpoint is unavailable) ---
