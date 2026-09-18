@@ -1,118 +1,133 @@
-"""Breadth-first expansion of a seed domain into a set of competitor domains.
+"""Lazy pool-based competitor expansion.
 
-To add a new competitor-discovery provider: write a `get_x_competitors(domain) -> set[str]`
-function (see spyfu.py / distill.py for the shape) and add it to PROVIDERS below.
+Each provider returns an ordered list. Take up to PER_PROVIDER from each into `domains`;
+everything else goes into `extra`. To reach the target count, draw from `extra` first; when
+`extra` runs dry, expand the next unexpanded domain. Expansion is roughly
+O(target / (PER_PROVIDER * num_providers)) rounds, not exponential in depth.
+
+v3.1: the three providers are now called in parallel per domain via a thread pool,
+and the AdaptiveLimiter no longer holds permits during min_interval sleeps — both
+changes together roughly triple enumeration throughput.
 """
-import concurrent.futures as cf
 import threading as th
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..config import log
 from ..net import normalize_domain, retry
 from ..concurrency import AdaptiveLimiter
-from ..progress import eta_str, rate_per_min
+from ..progress import fmt_secs
 from .distill import get_distill_competitors
 from .spyfu import get_spyfu_competitors
 from .owler import get_owler_competitors
-from .wappy import get_wappalyzer_competitors
-# (provider_fn, short_label_for_logs)
+
 PROVIDERS = [
     (get_spyfu_competitors, "S"),
     (get_distill_competitors, "D"),
     (get_owler_competitors, "O"),
-    #(get_wappalyzer_competitors, "W"),
 ]
 
-
-def _limited_call(fn, domain, limiter):
-    """Run fn(domain) inside the limiter so every retry attempt goes through admission control."""
-    with limiter:
-        return fn(domain)
+PER_PROVIDER = 5
 
 
-def _query_provider(domain, fn, label, seen, lock, limiter, source_counts, ui=None):
-    """Run a single provider against a single domain; merge genuinely-new domains
-    into `seen`. This is the unit of work submitted to the executor — one future
-    per (domain, provider) pair, not one future per domain, so a domain's 4
-    provider calls run concurrently instead of serially inside one thread."""
-    try:
-        new = retry(lambda: _limited_call(fn, domain, limiter)) or set()
-        with lock:
-            delta = new - seen
-            seen.update(new)
-            source_counts[label] = source_counts.get(label, 0) + len(delta)
-        log.info(f"[{label}] {domain} found {len(new)}")
-        return delta
-    except Exception as e:
-        log.error(f"[{label}] {domain} err: {e}")
-        if ui:
-            ui.checkpoint(f"enumeration  {label} {domain} err: {e}", ok=False)
-        return set()
+class Enumerator:
+    def __init__(self, seed, target, workers=8, delay=0.5, ui=None):
+        self.seed = normalize_domain(seed)
+        self.target = target
+        self.ui = ui
+        self.workers = workers
+        self.domains = []
+        self.extra = []
+        self.unexpanded = []
+        self.seen = {self.seed} if self.seed else set()
+        # min_interval=0: rely on AIMD alone for pacing. The old delay-based gate
+        # held permits during sleep and hard-capped throughput at 1/delay req/s.
+        self.limiter = AdaptiveLimiter(max_permits=workers, min_interval=0)
+        self._lock = th.Lock()
 
+    def _call(self, fn, domain):
+        with self.limiter:
+            return fn(domain)
 
-def enumerate_domains(seed_domain, workers, delay, min_targets, ui=None):
-    """BFS out from `seed_domain`, expanding level by level with no depth cap,
-    until `min_targets` total domains are found or the frontier naturally runs
-    dry. On hitting min_targets mid-level, in-flight futures finish but no new
-    ones are submitted and remaining queued futures are cancelled."""
-    seed = normalize_domain(seed_domain)
-    if not seed:
-        log.error("enumerate_domains: empty seed domain")
-        return []
+    def _expand(self, domain):
+        log.info(f"[ENUM] expand {domain}")
 
-    seen, frontier = {seed}, {seed}
-    # limiter.max_permits is the real concurrency ceiling (network-facing, AIMD-adjusted).
-    # The ThreadPoolExecutor just needs enough threads that it's never the bottleneck in
-    # front of the limiter -- workers domains x 4 providers each, all eligible to run at
-    # once, so the limiter's permits (which can climb above `workers`) are always reachable.
-    limiter = AdaptiveLimiter(max_permits=workers, min_interval=delay)
-    pool_size = workers * len(PROVIDERS)
-    level = 0
-    start = time.monotonic()  # ponytail: one clock for the whole run, ETA is coarse on purpose
-    while frontier:
-        level += 1
-        log.info(f"Depth {level}: Scanning {len(frontier)} domains (permits: {limiter.permits}/{limiter.max_permits})")
-        next_frontier, lock = set(), th.Lock()
-        source_counts = {}
-        req_count = 0
-        hit_cap = False
-
-        def report_progress():
-            nonlocal req_count
-            req_count += 1  # ponytail: display-only counter, minor races under GIL are fine
-            if ui:
-                n = len(seen)
-                ui.status(
-                    f"enumerating  depth {level} · {n}/{min_targets} targets · {req_count} requests "
-                    f"· {rate_per_min(start, n):.0f}/min · ETA {eta_str(start, n, min_targets)}"
+        # Fan out all providers in parallel; each still goes through the shared
+        # AdaptiveLimiter so global request concurrency stays bounded.
+        futures = {}
+        with ThreadPoolExecutor(max_workers=len(PROVIDERS)) as pool:
+            for fn, label in PROVIDERS:
+                fut = pool.submit(
+                    lambda f=fn, l=label: (l, retry(lambda: self._call(f, domain)) or [])
                 )
+                futures[fut] = label
 
-        with cf.ThreadPoolExecutor(max_workers=pool_size) as ex:
-            futures = {
-                ex.submit(_query_provider, d, fn, label, seen, lock, limiter, source_counts, ui): (d, label)
-                for d in frontier for fn, label in PROVIDERS
-            }
-            for f in cf.as_completed(futures):
-                next_frontier.update(f.result())
-                report_progress()
-                if len(seen) >= min_targets:
-                    hit_cap = True
-                    ex.shutdown(cancel_futures=True)
-                    break
-        frontier = next_frontier
-        seen.update(frontier)
-        log.info(f"Depth {level}: found {len(next_frontier)} new targets (total unique so far: {len(seen)})")
-        if ui:
-            breakdown = " ".join(f"{label}:{n}" for label, n in sorted(source_counts.items()) if n)
-            ui.checkpoint(
-                f"enumeration  depth {level} → {len(next_frontier)} new targets"
-                f"{' (' + breakdown + ')' if breakdown else ''} ({len(seen)} total)"
+            for fut in as_completed(futures):
+                label = futures[fut]
+                try:
+                    _, results = fut.result()
+                except Exception as e:
+                    log.error(f"[{label}] {domain} err: {e}")
+                    if self.ui:
+                        self.ui.v(2, f"{label} lookup failed for {domain}: {e}", ok=False)
+                    continue
+
+                fresh = []
+                for r in results:
+                    d = normalize_domain(r)
+                    if d and d not in self.seen:
+                        self.seen.add(d)
+                        fresh.append(d)
+
+                log.info(f"[{label}] {domain} -> {len(fresh)} fresh")
+                if self.ui:
+                    self.ui.v(2, f"{label} {domain}: {len(fresh)} fresh")
+                with self._lock:
+                    top, rest = fresh[:PER_PROVIDER], fresh[PER_PROVIDER:]
+                    for d in top:
+                        if len(self.domains) < self.target:
+                            self.domains.append(d)
+                        else:
+                            self.extra.append(d)
+                    self.extra.extend(rest)
+                    self.unexpanded.extend(fresh)
+
+        with self._lock:
+            self.unexpanded = [d for d in self.unexpanded if d != domain]
+
+    def run(self):
+        if not self.seed:
+            log.error("enumerate_domains: empty seed domain")
+            return []
+
+        if self.ui:
+            self.ui.phase("enumerating", self.target)
+        start = time.monotonic()
+
+        self._expand(self.seed)
+        while len(self.domains) < self.target:
+            before = len(self.domains)
+            if self.extra:
+                self.domains.append(self.extra.pop(0))
+            elif self.unexpanded:
+                self._expand(self.unexpanded.pop(0))
+            else:
+                break
+            if self.ui and len(self.domains) > before:
+                self.ui.advance(len(self.domains) - before)
+
+        log.info(
+            f"[ENUM] complete: {len(self.domains)}/{self.target} domains "
+            f"(pool leftover: {len(self.extra)})"
+        )
+        if self.ui:
+            self.ui.checkpoint(
+                f"enumerated {len(self.domains)}/{self.target} target(s) in "
+                f"{fmt_secs(time.monotonic() - start)} — "
+                f"{len(self.extra)} still in pool"
             )
-        if hit_cap:
-            log.info(f"Hit min_targets={min_targets}, stopping enumeration early at depth {level}")
-            if ui:
-                ui.checkpoint(f"enumeration  stopped early: reached max targets ({min_targets})")
-            break
+        return self.domains
 
-    log.info(f"Enumeration complete: {len(seen)} total targets across {level} depth(s)")
-    return sorted(seen)
+
+def enumerate_domains(seed, target, workers=8, delay=0.5, ui=None):
+    return Enumerator(seed, target, workers, delay, ui).run()

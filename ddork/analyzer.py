@@ -1,87 +1,136 @@
-"""Orchestrates the discovery sources + classifier into a per-domain result, and runs a batch."""
+"""Per-domain discovery + isBounty classification, batched across domains.
+
+Pipeline per domain:
+  1. security.txt — deterministic, runs first; if it advertises a fetchable
+     policy URL, that URL is the only candidate.
+  2. Otherwise Exa.  "ok"/"empty" → candidates (or none) from the search.
+  3. Otherwise Exa fallback is the only remaining search source.
+
+Candidates are canonicalized (www-stripped) and deduped before fetching.
+"""
 import asyncio as aio
 import time
 
-from .classify import classify_bounty
 from .config import log
-from .progress import eta_str, rate_per_min
-from .scrape import fetch_text
-from .sources.ddg import search_ddg
-from .sources.exa import search_exa
+from .net import canonicalize_url, gated_sync, domain_limiter
+from .progress import fmt_secs
+from .scrape import fetch_and_clean
 from .sources.security_txt import check_security_txt
+#from .sources.ddg import search_ddg
+from .sources.exa import search_exa
+
+from isbounty import Pipeline, PageContent
+from isbounty.core.text_utils import split_sentences
+
+_pipeline = Pipeline()
 
 
-async def analyze_domain(domain, semaphore, tick=None):
+async def _classify(url, raw_text, domain, security_txt=None, headings=None):
+    """Run the isbounty pipeline in a thread so it doesn't block the event loop."""
+    if not raw_text:
+        return None
+    try:
+        def _run():
+            page = PageContent(
+                url=url,
+                raw_text=raw_text,
+                sentences=split_sentences(raw_text),
+                headings=headings or [],
+                domain=domain,
+                security_txt=security_txt,
+            )
+            return _pipeline.run_from_page(page)
+
+        return await aio.to_thread(_run)
+    except Exception as e:
+        log.error(f"[CLS] {url} err: {e}")
+        return None
+
+
+def _finding(domain, url, source, result):
+    return {
+        "domain": domain,
+        "url": url,
+        "source": source,
+        "label": getattr(result, "label", "NOT_PROGRAM"),
+        "confidence": float(getattr(result, "confidence", 0.0)),
+        "decision_path": getattr(result, "decision_path", "") or "",
+        "reasons": list(getattr(result, "reasons", []) or []),
+    }
+
+
+MAX_URLS_PER_DOMAIN = 5
+
+
+async def analyze_domain(domain, semaphore, limiter, ui=None):
     async with semaphore:
-        log.info(f"[ANZ] Start {domain}")
+        log.info(f"[ANZ] start {domain}")
 
-        sec, hit = await aio.gather(check_security_txt(domain), search_ddg(domain))
-        if tick:
-            tick()
-        if not hit:
-            hit = await search_exa(domain)
-            if tick:
-                tick()
+        sec = await check_security_txt(domain, limiter)
+        sec_body = sec.get("body") if sec.get("found") else None
 
-        url, source = sec["policy_url"], "sec.txt"
-        # security.txt body is also a classification fallback — a site with a security.txt
-        # but no explicit Policy: URL used to get zero signal at all
-        snippet, title = sec.get("snippet"), None
-        if not url and hit:
-            url, source, snippet, title = hit["url"], hit["source"], hit.get("snippet", ""), hit.get("title", "")
+        candidates = []
+        if sec.get("policy_url"):
+            candidates.append((sec["policy_url"], "sec.txt"))
+        else:
+            try:
+                exa = await search_exa(domain)
+                candidates.extend((r["url"], "exa") for r in (exa or []))
+            except Exception as e:
+                log.warning(f"[EXA] {domain} err: {e}")
 
-        log.info(f"[ANZ] {domain} src: {source} url: {url}")
+        seen_canon = set()
+        unique = []
+        for url, src in candidates:
+            c = canonicalize_url(url)
+            if c and c not in seen_canon:
+                seen_canon.add(c)
+                unique.append((url, src))
+        unique = unique[:MAX_URLS_PER_DOMAIN]
 
-        page_text = await aio.to_thread(fetch_text, url) if url else None
-        if tick:
-            tick()
-        bounty = classify_bounty(page_text) if page_text else None
+        async def process_url(url, source):
+            text, headings = await gated_sync(
+                limiter, fetch_and_clean, url, domain=domain
+            )
+            if not text:
+                return None
+            res = await _classify(url, text, domain,
+                                  security_txt=sec_body, headings=headings)
+            return _finding(domain, url, source, res) if res else None
 
-        if not bounty or bounty["confidence"] == "low":
-            snippet_bounty = classify_bounty(snippet) if snippet else None
-            if snippet_bounty and snippet_bounty["confidence"] != "low":
-                bounty = snippet_bounty
-                bounty["source_note"] = "snippet_fallback"
+        results = await aio.gather(*[process_url(u, s) for u, s in unique])
+        findings = [r for r in results if r is not None]
 
-        if not bounty:
-            bounty = {"offers_money": None, "confidence": "low", "evidence": "none", "evidence_quote": None}
-
-        log.info(f"[ANZ] {domain} FIN: money={bounty.get('offers_money')} conf={bounty.get('confidence')}")
-        return {
-            "domain": domain,
-            "sec_txt": sec,
-            "source": source,
-            "url": url,
-            "title": title,
-            "page": page_text[:600] if page_text else None,
-            "bounty": bounty,
-        }
+        log.info(f"[ANZ] {domain} FIN: {len(findings)} findings "
+                 f"(candidates: {len(unique)})")
+        if ui:
+            ui.v(2, f"{domain}: {len(findings)} findings "
+                    f"from {len(unique)} candidate(s)")
+        return {"domain": domain, "findings": findings}
 
 
-async def run_workflow(domains, workers=8, ui=None):
-    semaphore = aio.Semaphore(max(1, workers))  # actually driven by -w now
+async def run_workflow(domains, workers=8, limiter=None, ui=None):
+    if limiter is None:
+        limiter = domain_limiter
+    sem = aio.Semaphore(max(1, workers))
     total = len(domains)
     results = []
     start = time.monotonic()
-    req_count = 0
 
-    def tick():
-        nonlocal req_count
-        req_count += 1
-        if ui:
-            n = len(results)
-            ui.status(
-                f"probing  {n}/{total} pages · {req_count} requests "
-                f"· {rate_per_min(start, n):.0f}/min · ETA {eta_str(start, n, total)}"
-            )
-
-    tasks = [aio.create_task(analyze_domain(d, semaphore, tick)) for d in domains]
     if ui:
-        ui.status(f"probing  0/{total} pages")
+        ui.phase("probing", total)
+
+    tasks = [aio.create_task(analyze_domain(d, sem, limiter, ui)) for d in domains]
     for t in aio.as_completed(tasks):
         results.append(await t)
-        tick()
+        if ui:
+            ui.advance()
+
     if ui:
-        resolved = sum(1 for r in results if r["url"])
-        ui.checkpoint(f"probing  {total}/{total} pages → {resolved} resolved, {total - resolved} unresolved")
+        resolved = sum(1 for r in results if r["findings"])
+        ui.checkpoint(
+            f"probing complete: {total} domain(s) in "
+            f"{fmt_secs(time.monotonic() - start)} — "
+            f"{resolved} with findings, {total - resolved} empty"
+        )
     return results

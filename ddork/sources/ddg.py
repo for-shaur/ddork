@@ -1,103 +1,137 @@
-"""DuckDuckGo search fallback for finding a domain's bug-bounty/disclosure page."""
+"""Exa (hermes.exa.ai) search — primary discovery source for a domain's
+bug-bounty/disclosure page.
+
+Exa is SEMANTIC: queries are natural-language sentences, not `site:` operators.
+We issue four phrasings per domain and merge results, keeping only URLs whose
+host is the target domain or a subdomain of it (same-site filter). Off-domain
+hits (Bugcrowd listings, bbscope, news articles) are dropped.
+"""
 import asyncio as aio
 import json
 import time
 
 from ..config import log
-from ..net import GlobalRateLimiter, is_relevant_result, resolve_ddg_redirect
+from ..net import (
+    GlobalRateLimiter,
+    RateLimited,
+    canonicalize_url,
+    get_session,
+    get_user_agent,
+    host_matches,
+)
 
-try:
-    from ddgs import DDGS
-    DDG_AVAILABLE = True
-except ImportError:
-    DDG_AVAILABLE = False
+_limiter = GlobalRateLimiter(requests_per_second=2)
+_cooldown_until = 0.0
 
-try:
-    from ddgs.exceptions import DDGSException, RatelimitException
-except ImportError:
-    # no bare `except Exception` fallback — define our own so a real bug
-    # (TypeError, etc.) doesn't get silently treated as "just a rate limit, retry"
-    class DDGSException(Exception):
-        pass
-
-    class RatelimitException(DDGSException):
-        pass
-
-# backend="auto" (the ddgs default) fans out to whatever it picks, wikipedia first — not
-# useful here. An ORDERED LIST, not a comma-joined string: passing a joined string to
-# dg.text(backend=...) makes ddgs itself fan out to all of them back-to-back with no delay,
-# so one block (brave 429) instantly burns through the rest too and surfaces as a generic
-# DDGSException("No results found") with zero backoff. We drive the iteration ourselves
-# instead, one backend at a time, so a block on engine N only costs engine N.
-BACKENDS = ["google", "bing", "brave", "yandex", "yahoo", "mojeek", "duckduckgo"]
-
-# Fixed backoff on a block: 5s, then 10s, then 18s. Exhaust this on one backend -> move to
-# the next backend rather than sit there forever.
-RETRY_WAITS = (5, 10, 18)
-
-# -w runs many domains concurrently; a plain Semaphore(2) per backend only bounds how many
-# requests are IN FLIGHT at once, not how fast they fire — 2 concurrent slots at 0.1s
-# latency is still ~20 req/s, which still trips e.g. brave's rate limit. Pace each backend
-# to a fixed rate instead, shared across every domain's search in this process.
-_backend_limiters = {b: GlobalRateLimiter(requests_per_second=1) for b in BACKENDS}
-
-# Rate limiting alone doesn't stop this: domain A gets blocked on mojeek and starts its own
-# 18s backoff; domain B, running concurrently, has no idea and walks into the same block a
-# few requests later, wasting a request and reinforcing the block. This dict is that missing
-# shared memory — the first domain to get blocked on a backend marks it hot, so every other
-# concurrent domain's _query_backend skips it outright instead of rediscovering the block
-# itself. Plain dict, no lock: asyncio is single-threaded/cooperative, and a float assignment
-# never straddles an `await`, so there's no torn read between coroutines.
-_backend_cooldown_until = {b: 0.0 for b in BACKENDS}
+QUERIES = (
+    "{c} bug bounty program page",
+    "{c} vulnerability disclosure policy",
+    "{c} responsible disclosure report a security vulnerability",
+    "{c} security.txt security policy",
+)
 
 
-def _run_backend(domain, backend):
-    with DDGS() as dg:
-        return list(dg.text(f'site:{domain} ("bug bounty" OR "responsible disclosure")', max_results=5, backend=backend))
+def _resolve_ref(value, array):
+    if isinstance(value, int) and 0 <= value < len(array):
+        return array[value]
+    if isinstance(value, list):
+        return [_resolve_ref(x, array) for x in value]
+    return value
 
 
-async def _query_backend(domain, backend):
-    """Try one backend, retrying on block per RETRY_WAITS. None = give up on this backend."""
-    remaining = _backend_cooldown_until[backend] - time.monotonic()
-    if remaining > 0:
-        log.info(f"[DDG] {domain} {backend} in shared cooldown ({remaining:.0f}s left, set by another domain), skipping")
-        return None
-
-    for attempt, wait in enumerate((*RETRY_WAITS, None)):
+def parse_exa_response(text):
+    results = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
         try:
-            await _backend_limiters[backend].wait_for_token()
-            log.info(f"[DDG] {domain} {backend} (try {attempt + 1})")
-            # run in a thread — a bare sync call inside `async def` would block the
-            # whole event loop and stall every other in-flight domain
-            results = await aio.to_thread(_run_backend, domain, backend)
-            log.info(f"[DDG] {domain} {backend} raw: {json.dumps(results)[:1000]}")
-            return results
-        except (RatelimitException, DDGSException) as e:
-            if wait is None:  # backoff schedule exhausted on this backend, move on
-                log.info(f"[DDG] {domain} {backend} still blocked after {len(RETRY_WAITS)} retries, skipping it: {e}")
-                return None
-            _backend_cooldown_until[backend] = time.monotonic() + wait
-            log.info(f"[DDG] {domain} {backend} blocked ({e}), shared cooldown {wait}s")
-            await aio.sleep(wait)
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if payload.get("type") != "data":
+            continue
+        for node in payload.get("nodes", []):
+            if node.get("type") != "data":
+                continue
+            arr = node.get("data", [])
+            if not arr or not isinstance(arr, list):
+                continue
+            meta = arr[0] if arr else {}
+            if not isinstance(meta, dict):
+                continue
+            results_idx = meta.get("results")
+            if results_idx is None or results_idx >= len(arr):
+                continue
+            result_indices = arr[results_idx]
+            if not isinstance(result_indices, list):
+                continue
+            for r_ix in result_indices:
+                if not isinstance(r_ix, int) or r_ix >= len(arr):
+                    continue
+                o = arr[r_ix]
+                if not isinstance(o, dict):
+                    continue
+                title, url, highlights, domain = (
+                    _resolve_ref(o.get(k), arr)
+                    for k in ("title", "url", "highlights", "domain")
+                )
+                if isinstance(highlights, list):
+                    highlights = " ".join(str(h) for h in highlights if h)
+                if url and isinstance(url, str):
+                    results.append({
+                        "title": str(title) if title else "",
+                        "url": url,
+                        "snippet": str(highlights) if highlights else "",
+                        "domain": str(domain) if domain else "",
+                    })
+    return results
+
+
+async def _query(domain, query, max_retries, initial_wait):
+    global _cooldown_until
+    wait = initial_wait
+    for _ in range(max_retries):
+        remaining = _cooldown_until - time.monotonic()
+        if remaining > 0:
+            await aio.sleep(remaining)
+        try:
+            await _limiter.wait_for_token()
+            r = await aio.to_thread(
+                get_session().get,
+                "https://hermes.exa.ai/search/__data.json",
+                params={"q": query, "type": "auto",
+                        "x-sveltekit-invalidated": "01"},
+                headers={"referer": "https://hermes.exa.ai/",
+                         "user-agent": get_user_agent()},
+                timeout=10,
+            )
+            if r.status_code == 429:
+                _cooldown_until = time.monotonic() + wait
+                raise RateLimited(f"exa 429 for {domain}", retry_after=wait)
+            if r.status_code != 200:
+                return []
+            return parse_exa_response(r.text)
+        except RateLimited:
+            wait = min(wait * 2, 20)
         except Exception as e:
-            log.error(f"[DDG] {domain} {backend} err: {e}")
-            return None
-    return None
+            log.error(f"[EXA] {domain} err: {e}")
+            return []
+    return []
 
 
-async def search_ddg(domain):
-    if not DDG_AVAILABLE:
-        log.info(f"[DDG] {domain} uninstalled")
-        return None
-
-    for backend in BACKENDS:
-        results = await _query_backend(domain, backend)
-        for r in results or []:
-            u = r.get("href", "")
-            if u and "wikipedia.org" not in u and is_relevant_result(domain, u, f"{r.get('title', '')} {r.get('body', '')}"):
-                ru = resolve_ddg_redirect(u)
-                log.info(f"[DDG] {domain} found: {ru}")
-                return {"url": ru, "source": "ddgs", "snippet": r.get("body", ""), "title": r.get("title", "")}
-
-    log.info(f"[DDG] {domain} no match on any backend")
-    return None
+async def search_exa(domain, max_retries=3, initial_wait=2):
+    company = domain.split(".")[0]
+    seen = set()
+    out = []
+    for tmpl in QUERIES:
+        hits = await _query(domain, tmpl.format(c=company),
+                            max_retries, initial_wait)
+        for h in hits:
+            url = h["url"]
+            if not host_matches(domain, url):
+                continue
+            c = canonicalize_url(url)
+            if c and c not in seen:
+                seen.add(c)
+                out.append(h)
+    return out

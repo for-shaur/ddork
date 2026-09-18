@@ -4,17 +4,42 @@ import sys
 
 log = lg.getLogger("scan")
 
+# 0 quiet · 1 normal · 2 verbose · 3 debug
+_LOG_LEVELS = {0: lg.WARNING, 1: lg.INFO, 2: lg.INFO, 3: lg.DEBUG}
 
-def configure_logging(debug):
+
+def configure_logging(verbose):
     """Call once, early, from cli.main().
 
-    --debug: today's behavior — full stream+file logging, no live UI.
-    default: file-only logging; stdout is owned by ui.ScanUI instead.
+    Level 3 (debug): stream + file logging, no live UI (cli disables it).
+    Levels 0–2:     file-only logging; stdout is owned by ui.ScanUI instead.
+
+    All handlers write UTF-8. Windows' default cp1252 crashes on any non-Latin-1
+    character in a logged URL (seen in the wild: an emoji inside a DDG result
+    URL), which takes down the whole process because logging's default error
+    path is to print a traceback and keep going — but the traceback itself
+    prints to the same broken stream, so the run dies.
     """
-    handlers = [lg.FileHandler("scan.log")]
-    if debug:
+    _reconfigure_std_streams()
+
+    handlers = [lg.FileHandler("scan.log", encoding="utf-8")]
+    if verbose >= 3:
         handlers.append(lg.StreamHandler(sys.stdout))
-    lg.basicConfig(level=lg.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=handlers, force=True)
+
+    lg.basicConfig(
+        level=_LOG_LEVELS.get(verbose, lg.INFO),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+
+
+def _reconfigure_std_streams():
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
 
 # --- Fallback user agents (used if the remote UA endpoint is unavailable) ---
@@ -26,6 +51,5 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
 ]
 
-# --- Request tuning ------------------------------------------------------
 DEFAULT_TIMEOUT = 15
 IMPERSONATE = "chrome110"
