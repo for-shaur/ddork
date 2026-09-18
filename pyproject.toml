@@ -16,4 +16,4 @@ dependencies = [
 ]
 
 [project.scripts]
-ddork = "ddork.cli:main"
+ddork = "ddork.cli:run"

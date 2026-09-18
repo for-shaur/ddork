@@ -10,11 +10,13 @@ and the AdaptiveLimiter no longer holds permits during min_interval sleeps — b
 changes together roughly triple enumeration throughput.
 """
 import threading as th
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..config import log
 from ..net import normalize_domain, retry
 from ..concurrency import AdaptiveLimiter
+from ..progress import fmt_secs
 from .distill import get_distill_competitors
 from .spyfu import get_spyfu_competitors
 from .owler import get_owler_competitors
@@ -67,9 +69,7 @@ class Enumerator:
                 except Exception as e:
                     log.error(f"[{label}] {domain} err: {e}")
                     if self.ui:
-                        self.ui.checkpoint(
-                            f"enumeration  {label} {domain} err: {e}", ok=False
-                        )
+                        self.ui.v(2, f"{label} lookup failed for {domain}: {e}", ok=False)
                     continue
 
                 fresh = []
@@ -80,6 +80,8 @@ class Enumerator:
                         fresh.append(d)
 
                 log.info(f"[{label}] {domain} -> {len(fresh)} fresh")
+                if self.ui:
+                    self.ui.v(2, f"{label} {domain}: {len(fresh)} fresh")
                 with self._lock:
                     top, rest = fresh[:PER_PROVIDER], fresh[PER_PROVIDER:]
                     for d in top:
@@ -97,23 +99,33 @@ class Enumerator:
         if not self.seed:
             log.error("enumerate_domains: empty seed domain")
             return []
+
+        if self.ui:
+            self.ui.phase("enumerating", self.target)
+        start = time.monotonic()
+
         self._expand(self.seed)
         while len(self.domains) < self.target:
+            before = len(self.domains)
             if self.extra:
                 self.domains.append(self.extra.pop(0))
             elif self.unexpanded:
                 self._expand(self.unexpanded.pop(0))
             else:
                 break
-            if self.ui:
-                self.ui.status(
-                    f"enumerating  {len(self.domains)}/{self.target} targets "
-                    f"· extra pool: {len(self.extra)}"
-                )
+            if self.ui and len(self.domains) > before:
+                self.ui.advance(len(self.domains) - before)
+
         log.info(
             f"[ENUM] complete: {len(self.domains)}/{self.target} domains "
             f"(pool leftover: {len(self.extra)})"
         )
+        if self.ui:
+            self.ui.checkpoint(
+                f"enumerated {len(self.domains)}/{self.target} target(s) in "
+                f"{fmt_secs(time.monotonic() - start)} — "
+                f"{len(self.extra)} still in pool"
+            )
         return self.domains
 
 

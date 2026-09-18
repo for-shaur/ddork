@@ -1,10 +1,21 @@
-"""Exa (hermes.exa.ai) search fallback. Returns list of {url,title,snippet} or []."""
+"""Exa (hermes.exa.ai) search fallback. Returns list of {url,title,snippet} or [].
+
+Only used when DDG reports "blocked" (see analyzer.py). Results are filtered
+through the same is_relevant_result predicate the other search source uses, so
+an Exa hit means the same thing as a DDG hit.
+"""
 import asyncio as aio
 import json
 import time
 
 from ..config import log
-from ..net import GlobalRateLimiter, RateLimited, get_session, get_user_agent
+from ..net import (
+    GlobalRateLimiter,
+    RateLimited,
+    get_session,
+    get_user_agent,
+    is_relevant_result,
+)
 
 _limiter = GlobalRateLimiter(requests_per_second=2)
 _cooldown_until = 0.0
@@ -51,7 +62,8 @@ def parse_exa_response(text):
                 if not isinstance(o, dict):
                     continue
                 title, url, highlights, domain = (
-                    _resolve_ref(o.get(k), arr) for k in ("title", "url", "highlights", "domain")
+                    _resolve_ref(o.get(k), arr)
+                    for k in ("title", "url", "highlights", "domain")
                 )
                 if isinstance(highlights, list):
                     highlights = " ".join(str(h) for h in highlights if h)
@@ -88,7 +100,17 @@ async def search_exa(domain, max_retries=3, initial_wait=2):
                 raise RateLimited(f"exa 429 for {domain}", retry_after=wait)
             if r.status_code != 200:
                 return []
-            return parse_exa_response(r.text)
+            hits = parse_exa_response(r.text)
+            relevant = [
+                h for h in hits
+                if is_relevant_result(
+                    domain, h["url"], f"{h['title']} {h['snippet']}"
+                )
+            ]
+            if hits and not relevant:
+                log.info(f"[EXA] {domain}: {len(hits)} raw hits, "
+                         f"0 passed relevance filter")
+            return relevant
         except RateLimited:
             wait = min(wait * 2, 20)
         except Exception as e:
