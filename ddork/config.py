@@ -53,3 +53,16 @@ USER_AGENTS = [
 
 DEFAULT_TIMEOUT = 15
 IMPERSONATE = "chrome110"
+
+# --- Package metadata ---------------------------------------------------
+# ddork's own GitHub repo. Set to "user/repo" if/when it has a public repo;
+# None disables the GitHub check and falls back to PyPI only.
+DDORK_PACKAGE = "ddork"
+DDORK_GITHUB = "forshaur/ddork"
+DDORK_GIT_URL = "https://github.com/forshaur/ddork"
+
+# Classifier. Installed from git, so the "latest" check reads the version
+# field from the repo's pyproject.toml rather than PyPI.
+CLASSIFIER_PACKAGE = "isbounty"
+CLASSIFIER_GITHUB = "forshaur/isbounty"
+CLASSIFIER_GIT_URL = "https://github.com/forshaur/isbounty"

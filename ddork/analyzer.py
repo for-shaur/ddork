@@ -7,10 +7,14 @@ Pipeline per domain:
   3. Otherwise Exa fallback is the only remaining search source.
 
 Candidates are canonicalized (www-stripped) and deduped before fetching.
+
+Classification is loaded lazily through classifier.py, so a missing or
+broken isbounty install no longer prevents the module from importing.
 """
 import asyncio as aio
 import time
 
+from .classifier import ClassifierUnavailable, classifier
 from .config import log
 from .net import canonicalize_url, gated_sync, domain_limiter
 from .progress import fmt_secs
@@ -19,31 +23,36 @@ from .sources.security_txt import check_security_txt
 #from .sources.ddg import search_ddg
 from .sources.exa import search_exa
 
-from isbounty import Pipeline, PageContent
-from isbounty.core.text_utils import split_sentences
-
-_pipeline = Pipeline()
-
 
 async def _classify(url, raw_text, domain, security_txt=None, headings=None):
-    """Run the isbounty pipeline in a thread so it doesn't block the event loop."""
+    """Classify one page. Returns the pipeline result or None.
+
+    Returns None (rather than raising) if the classifier is unavailable or
+    classification fails for any reason — a single unclassifiable page must
+    never abort the run.
+    """
     if not raw_text:
+        return None
+    if not classifier.available:
         return None
     try:
         def _run():
-            page = PageContent(
+            return classifier.classify_page(
                 url=url,
                 raw_text=raw_text,
-                sentences=split_sentences(raw_text),
-                headings=headings or [],
+                headings=headings,
                 domain=domain,
                 security_txt=security_txt,
             )
-            return _pipeline.run_from_page(page)
 
         return await aio.to_thread(_run)
+    except ClassifierUnavailable:
+        # Classifier disappeared between the availability check and the
+        # call. Log once; the CLI preflight normally prevents this.
+        log.error("[CLS] classifier unavailable mid-run; skipping page")
+        return None
     except Exception as e:
-        log.error(f"[CLS] {url} err: {e}")
+        log.error(f"[CLS] {url} err: {e.__class__.__name__}: {e}")
         return None
 
 

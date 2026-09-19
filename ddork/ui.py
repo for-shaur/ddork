@@ -1,30 +1,23 @@
 """Terminal output in sqlmap's style: timestamped permanent lines plus one
 in-place progress bar. Colors auto-disable on non-TTY.
 
+Roles (see colors.Palette): brand for phases, success/error for [+]/[!],
+neutral for brackets, muted for secondary text.
+
 Verbosity:
   0  quiet     — no UI, only the final report
   1  normal    — permanent lines + bar (default)
   2  verbose   — adds per-source and per-domain checkpoints
-  3  debug     — UI disabled; raw logger takes over (see config.configure_logging)
+  3  debug     — UI disabled; raw logger takes over
 """
 import time
 
 from .colors import palette
 from .progress import ProgressBar
 
-# Phase label -> palette method name. Feeds both the bar and any [phase] tag.
-PHASE_COLORS = {
-    "enumerating": "bright_cyan",
-    "probing":     "bright_magenta",
-    "security":    "bright_blue",
-    "exa":         "bright_yellow",
-    "searx":       "bright_yellow",
-    "ddg":         "bright_yellow",
-}
-
 
 def _stamp():
-    return palette.grey(time.strftime("%H:%M:%S"))
+    return palette.muted(time.strftime("%H:%M:%S"))
 
 
 class ScanUI:
@@ -56,8 +49,8 @@ class ScanUI:
             self._bar.resume()
 
     def checkpoint(self, text, ok=True):
-        mark = palette.bright_green("+") if ok else palette.bright_red("!")
-        tag = f"{palette.white('[')}{mark}{palette.white(']')}"
+        mark = palette.success("+") if ok else palette.error("!")
+        tag = f"{palette.neutral('[')}{mark}{palette.neutral(']')}"
         self.line(f"{_stamp()} {tag} {text}")
 
     def error(self, text):
@@ -74,8 +67,7 @@ class ScanUI:
         """Start (or restart) the single live bar for a phase."""
         if self._bar:
             self._bar.finish()
-        color = PHASE_COLORS.get(label, "bright_magenta")
-        self._bar = ProgressBar(label, total, color=color)
+        self._bar = ProgressBar(label, total)
         self._bar.start_ticker()
 
     def advance(self, n=1):
