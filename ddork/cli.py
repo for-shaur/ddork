@@ -24,7 +24,7 @@ def build_parser():
     )
     p.add_argument("-n", "--min-targets", type=int, default=None,
                    help="stop enumeration once this many total targets are found")
-    p.add_argument("-w", type=int, default=8, help="worker concurrency (default: 8)")
+    p.add_argument("-w", type=int, default=5, help="worker concurrency (default: 5)")
     p.add_argument("--delay", type=float, default=0.1,
                    help="min seconds between requests for provider calls (default: 0.1)")
     p.add_argument("--min-conf", type=float, default=None,

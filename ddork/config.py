@@ -26,9 +26,14 @@ def configure_logging(verbose):
     if verbose >= 3:
         handlers.append(lg.StreamHandler(sys.stdout))
 
+    fmt = (
+        "%(asctime)s [%(levelname)s] %(message)s"
+        if verbose >= 3
+        else "[%(levelname)s] %(message)s"
+    )
     lg.basicConfig(
         level=_LOG_LEVELS.get(verbose, lg.INFO),
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format=fmt,
         handlers=handlers,
         force=True,
     )
