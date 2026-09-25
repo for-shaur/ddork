@@ -1,34 +1,31 @@
 """Console report rendering and file output.
 
-Layout: one block per finding, grouped by label.
+Layout: one entry per finding, grouped under a label header.
 
     PAID_BB
-    ──────────────────────────────────────────────────────────────────
-    acme.com                          conf 0.94   sec.txt
-      https://acme.com/security
-      bug_bounty_signal → PAID_BB_VERIFIED
+      acme.com                                              sec.txt
+        https://acme.com/security
+        bug_bounty_signal → PAID_BB_VERIFIED
 
-URLs are never truncated — they sit on their own line, wrapping if the
-terminal is narrow. Hidden NOT_PROGRAM findings are still counted in the
-header.
+The source tag is right-aligned on the domain line in muted grey. URLs are
+never truncated; they sit on their own line. Hidden NOT_PROGRAM findings are
+still counted in the header.
 
-Color roles: labels use success/neutral/muted, confidence is success/warn/
-muted by tier, URLs use link, decision path is muted.
+Color roles: labels use success/brand/muted, URLs use link, decision path
+and source are muted.
 """
 from .colors import palette
 
 LABEL_ORDER = {"PAID_BB": 0, "VDP": 1, "NOT_PROGRAM": 2}
 LABELS = tuple(LABEL_ORDER.keys())
 
-# Section header color per label.
 _LABEL_COLOR = {
     "PAID_BB":     "success",
     "VDP":         "brand",
     "NOT_PROGRAM": "muted",
 }
 
-_DOMAIN_W = 42
-_RULE_W = 72
+_WIDTH = 72
 
 
 def _flatten(results):
@@ -42,50 +39,35 @@ def _sort_key(f):
     return (LABEL_ORDER.get(f["label"], 9), -f["confidence"], f["domain"])
 
 
-def _conf_color(conf):
-    if conf >= 0.90:
-        return "success"
-    if conf >= 0.70:
-        return "warn"
-    return "muted"
-
-
-def _conf_text(conf):
-    return getattr(palette, _conf_color(conf))(f"{conf:.2f}")
-
-
 def _print_header(total, paid, vdp, hidden):
-    rule = "═" * _RULE_W
-    print(palette.bold(rule))
-    stats = (
+    print(
         f"  {palette.bold(str(total))} findings   "
         f"{palette.muted('·')}   "
         f"{palette.success('PAID_BB')} {paid}   "
         f"{palette.brand('VDP')} {vdp}   "
         f"{palette.muted('NOT_PROGRAM')} {hidden} {palette.muted('(hidden)')}"
     )
-    print(stats)
-    print(palette.bold(rule))
     print()
 
 
 def _print_group(label, rows):
     role = _LABEL_COLOR.get(label, "neutral")
-    header = getattr(palette, role)(f"  {label}")
-    print(header)
-    print(palette.muted("  " + "─" * (_RULE_W - 2)))
+    print(getattr(palette, role)(f"  {label}"))
     for f in rows:
+        print()
         _print_finding(f)
-    print()
 
 
 def _print_finding(f):
-    domain = palette.bold(f["domain"])
-    conf = _conf_text(f["confidence"])
-    source = palette.muted(f.get("source") or "")
+    domain = f["domain"]
+    source = f.get("source") or ""
+    left = f"  {domain}"
 
-    pad = " " * max(1, _DOMAIN_W - len(f["domain"]))
-    print(f"  {domain}{pad}{palette.muted('conf')} {conf}   {source}")
+    if source:
+        pad = " " * max(1, _WIDTH - len(left) - len(source))
+        print(f"{palette.bold(left)}{pad}{palette.muted(source)}")
+    else:
+        print(palette.bold(left))
 
     url = f.get("url") or ""
     if url:
@@ -118,9 +100,6 @@ def print_report(results, show_all=False):
         by_label.setdefault(f["label"], []).append(f)
     for label in sorted(by_label, key=lambda L: LABEL_ORDER.get(L, 9)):
         _print_group(label, by_label[label])
-
-    print(palette.bold("═" * _RULE_W))
-    print()
 
 
 def save_urls(results, path, label_filter=None, min_conf=None):

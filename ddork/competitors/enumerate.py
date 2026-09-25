@@ -5,9 +5,8 @@ everything else goes into `extra`. To reach the target count, draw from `extra` 
 `extra` runs dry, expand the next unexpanded domain. Expansion is roughly
 O(target / (PER_PROVIDER * num_providers)) rounds, not exponential in depth.
 
-v3.1: the three providers are now called in parallel per domain via a thread pool,
-and the AdaptiveLimiter no longer holds permits during min_interval sleeps — both
-changes together roughly triple enumeration throughput.
+The three providers are called in parallel per domain via a thread pool, all
+sharing one AdaptiveLimiter so global request concurrency stays bounded.
 """
 import threading as th
 import time

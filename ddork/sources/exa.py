@@ -1,8 +1,11 @@
-"""Exa (hermes.exa.ai) search fallback. Returns list of {url,title,snippet} or [].
+"""Exa (hermes.exa.ai) search source.
 
-Only used when DDG reports "blocked" (see analyzer.py). Results are filtered
-through the same is_relevant_result predicate the other search source uses, so
-an Exa hit means the same thing as a DDG hit.
+Primary engine for ~50% of search-needing domains (assigned by
+analyzer._engine_cycle). Returns a possibly-empty list of relevant
+{url,title,snippet} dicts; empty means "no results", not a failure. Raises
+on failure so the caller can hand the domain to Olostep.
+
+Retries are 429-only; any other error propagates on first sight.
 """
 import asyncio as aio
 import json
@@ -78,42 +81,46 @@ def parse_exa_response(text):
 
 
 async def search_exa(domain, max_retries=3, initial_wait=2):
+    """Search Exa for `site:{domain} "bug bounty"`.
+
+    Returns relevant hits (possibly empty). Raises on any failure so the
+    caller can hand the domain to Olostep. Retries are 429-only; any other
+    error propagates immediately.
+    """
     global _cooldown_until
     wait = initial_wait
     for attempt in range(max_retries):
         remaining = _cooldown_until - time.monotonic()
         if remaining > 0:
             await aio.sleep(remaining)
-        try:
-            await _limiter.wait_for_token()
-            r = await aio.to_thread(
-                get_session().get,
-                "https://hermes.exa.ai/search/__data.json",
-                params={"q": f'site:{domain} "bug bounty"',
-                        "type": "fast", "x-sveltekit-invalidated": "01"},
-                headers={"referer": "https://hermes.exa.ai/",
-                         "user-agent": get_user_agent()},
-                timeout=10,
+        await _limiter.wait_for_token()
+        r = await aio.to_thread(
+            get_session().get,
+            "https://hermes.exa.ai/search/__data.json",
+            params={"q": f'site:{domain} "bug bounty"',
+                    "type": "neural", "x-sveltekit-invalidated": "01"},
+            headers={"referer": "https://hermes.exa.ai/",
+                     "user-agent": get_user_agent()},
+            timeout=10,
+        )
+        if r.status_code == 429:
+            _cooldown_until = time.monotonic() + wait
+            if attempt < max_retries - 1:
+                wait = min(wait * 2, 20)
+                continue
+            raise RateLimited(f"exa 429 for {domain}", retry_after=wait)
+        if r.status_code != 200:
+            raise RuntimeError(f"exa {domain}: HTTP {r.status_code}")
+
+        hits = parse_exa_response(r.text)
+        relevant = [
+            h for h in hits
+            if is_relevant_result(
+                domain, h["url"], f"{h['title']} {h['snippet']}"
             )
-            if r.status_code == 429:
-                _cooldown_until = time.monotonic() + wait
-                raise RateLimited(f"exa 429 for {domain}", retry_after=wait)
-            if r.status_code != 200:
-                return []
-            hits = parse_exa_response(r.text)
-            relevant = [
-                h for h in hits
-                if is_relevant_result(
-                    domain, h["url"], f"{h['title']} {h['snippet']}"
-                )
-            ]
-            if hits and not relevant:
-                log.info(f"[EXA] {domain}: {len(hits)} raw hits, "
-                         f"0 passed relevance filter")
-            return relevant
-        except RateLimited:
-            wait = min(wait * 2, 20)
-        except Exception as e:
-            log.error(f"[EXA] {domain} err: {e}")
-            return []
-    return []
+        ]
+        if hits and not relevant:
+            log.info(f"[EXA] {domain}: {len(hits)} raw hits, "
+                     f"0 passed relevance filter")
+        return relevant
+    raise RuntimeError(f"exa {domain}: exhausted retries")

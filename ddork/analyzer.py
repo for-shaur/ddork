@@ -3,13 +3,14 @@
 Pipeline per domain:
   1. security.txt — deterministic, runs first; if it advertises a fetchable
      policy URL, that URL is the only candidate.
-  2. Otherwise Exa.  "ok"/"empty" → candidates (or none) from the search.
-  3. Otherwise Exa fallback is the only remaining search source.
+  2. Otherwise a search engine. Search-needing domains are split ~50/50
+     between Exa and Olostep by a round-robin cycle. Each domain gets one
+     primary engine; the other is called only if the primary raises.
 
 Candidates are canonicalized (www-stripped) and deduped before fetching.
 
 Classification is loaded lazily through classifier.py, so a missing or
-broken isbounty install no longer prevents the module from importing.
+broken isbounty install does not prevent the module from importing.
 """
 import asyncio as aio
 import itertools
@@ -21,15 +22,17 @@ from .net import canonicalize_url, gated_sync, domain_limiter
 from .progress import fmt_secs
 from .scrape import fetch_and_clean
 from .sources.security_txt import check_security_txt
-#from .sources.ddg import search_ddg
 from .sources.exa import search_exa
 from .sources.olostep import search_olostep
 
-# Alternates which engine is *primary* for each domain so the two engines
-# share the load roughly equally across a run.  asyncio is single-threaded,
-# so advancing a bare cycle between coroutines is safe without a lock.
-_engine_cycle = itertools.cycle([(search_exa, "exa", search_olostep, "olostep"),
-                                  (search_olostep, "olostep", search_exa, "exa")])
+# Round-robin primary assignment: half of search-needing domains go to Exa
+# first, half to Olostep. The other engine is only invoked if the primary
+# raises (see _search_with_fallback). asyncio is single-threaded, so
+# advancing a bare cycle between coroutines is safe without a lock.
+_engine_cycle = itertools.cycle([
+    (search_exa, "exa", search_olostep, "olostep"),
+    (search_olostep, "olostep", search_exa, "exa"),
+])
 
 
 async def _classify(url, raw_text, domain, security_txt=None, headings=None):
@@ -79,6 +82,38 @@ def _finding(domain, url, source, result):
 MAX_URLS_PER_DOMAIN = 5
 
 
+async def _search_with_fallback(domain, primary_fn, primary_src,
+                                fallback_fn, fallback_src):
+    """Run the assigned primary engine; fall back only on error.
+
+    An empty list is a valid answer ("no bounty page for this domain") and
+    is NOT retried against the other engine — that would double request
+    volume across the run for no gain. Only an exception triggers the
+    handoff. Returns (hits, source_label).
+    """
+    try:
+        hits = await primary_fn(domain)
+        for h in hits or []:
+            log.debug(f"[{primary_src.upper()}] {domain} → {h['url']}")
+        log.info(f"[SEARCH] {domain}: {primary_src} → {len(hits or [])} hit(s)")
+        return hits or [], primary_src
+    except Exception as e:
+        log.warning(f"[SEARCH] {domain}: {primary_src} failed "
+                    f"({e.__class__.__name__}: {e}); retrying with {fallback_src}")
+
+    try:
+        hits = await fallback_fn(domain)
+        for h in hits or []:
+            log.debug(f"[{fallback_src.upper()}] {domain} → {h['url']}")
+        log.info(f"[SEARCH] {domain}: {fallback_src} (fallback) → "
+                 f"{len(hits or [])} hit(s)")
+        return hits or [], fallback_src
+    except Exception as e:
+        log.warning(f"[SEARCH] {domain}: {fallback_src} also failed "
+                    f"({e.__class__.__name__}: {e}); giving up")
+        return [], fallback_src
+
+
 async def analyze_domain(domain, semaphore, limiter, ui=None):
     async with semaphore:
         log.info(f"[ANZ] start {domain}")
@@ -91,41 +126,12 @@ async def analyze_domain(domain, semaphore, limiter, ui=None):
             candidates.append((sec["policy_url"], "sec.txt"))
         else:
             primary_fn, primary_src, fallback_fn, fallback_src = next(_engine_cycle)
-            log.debug(f"[SEARCH] {domain}: assigned primary={primary_src.upper()}, "
-                      f"fallback={fallback_src.upper()}")
-            try:
-                hits = await primary_fn(domain)
-                if hits:
-                    log.info(f"[SEARCH] {domain}: {primary_src} succeeded "
-                             f"({len(hits)} hits), skipping {fallback_src}")
-                    for h in hits:
-                        log.debug(f"[{primary_src.upper()}] {domain} → {h['url']}")
-                    candidates.extend((r["url"], primary_src) for r in hits)
-                else:
-                    log.info(f"[SEARCH] {domain}: {primary_src} empty, "
-                             f"trying {fallback_src}")
-                    hits = await fallback_fn(domain)
-                    if hits:
-                        log.debug(f"[SEARCH] {domain}: {fallback_src} fallback "
-                                  f"returned {len(hits)} hit(s)")
-                        for h in hits:
-                            log.debug(f"[{fallback_src.upper()}] {domain} → {h['url']}")
-                    else:
-                        log.debug(f"[SEARCH] {domain}: both engines returned empty")
-                    candidates.extend((r["url"], fallback_src) for r in (hits or []))
-            except Exception as e:
-                log.warning(f"[SEARCH] {domain} {primary_src} err: {e}; "
-                            f"trying {fallback_src}")
-                try:
-                    hits = await fallback_fn(domain)
-                    if hits:
-                        log.debug(f"[SEARCH] {domain}: {fallback_src} fallback "
-                                  f"returned {len(hits)} hit(s) after {primary_src} error")
-                        for h in hits:
-                            log.debug(f"[{fallback_src.upper()}] {domain} → {h['url']}")
-                    candidates.extend((r["url"], fallback_src) for r in (hits or []))
-                except Exception as e2:
-                    log.warning(f"[SEARCH] {domain} {fallback_src} err: {e2}")
+            log.debug(f"[SEARCH] {domain}: primary={primary_src.upper()}, "
+                      f"fallback={fallback_src.upper()} (on error only)")
+            hits, hits_src = await _search_with_fallback(
+                domain, primary_fn, primary_src, fallback_fn, fallback_src
+            )
+            candidates.extend((r["url"], hits_src) for r in hits)
 
         seen_canon = set()
         unique = []
