@@ -29,9 +29,11 @@ from .sources.olostep import search_olostep
 # first, half to Olostep. The other engine is only invoked if the primary
 # raises (see _search_with_fallback). asyncio is single-threaded, so
 # advancing a bare cycle between coroutines is safe without a lock.
+# Exa-only: olostep playground is capped at 50 req/24h per IP and 429s
+# after a single run. Kept on disk for when a real API key is wired in.
 _engine_cycle = itertools.cycle([
     (search_exa, "exa", search_olostep, "olostep"),
-    (search_olostep, "olostep", search_exa, "exa"),
+    #search_olostep, "olostep", search_exa, "exa"),
 ])
 
 
