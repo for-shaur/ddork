@@ -137,6 +137,10 @@ ddork -f domains.txt -o paid_bounties.tsv PAID_BB
 
 ---
 
+## Credits:
+My friend Sarthak unknowingly gave me the idea of this tool when he found out a target from LinkedIn, which was not indexed on google for the dorks we tried despite having all the keywords in its website.
+
 ## License
 
 This project is distributed under the terms of the GNU General Public License v3.0. See the [LICENSE](LICENSE) file for details.
+
