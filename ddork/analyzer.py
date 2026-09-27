@@ -32,7 +32,7 @@ from .sources.olostep import search_olostep
 # Exa-only: olostep playground is capped at 50 req/24h per IP and 429s
 # after a single run. Kept on disk for when a real API key is wired in.
 _engine_cycle = itertools.cycle([
-    (search_exa, "exa", search_olostep, "olostep"),
+    (search_exa, "exa", search_exa, "exa")#search_olostep, "olostep"),
     #search_olostep, "olostep", search_exa, "exa"),
 ])
 
