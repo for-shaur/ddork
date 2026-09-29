@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="img/55625.png" alt="ddork logo" width="350" />
+</p>
+
 # ddork
 
 ddork is a security reconnaissance and bug-bounty program discovery tool designed to discover competitor domains and automatically classify their bug-bounty or Vulnerability Disclosure Program (VDP) policies.
@@ -11,6 +15,12 @@ using google dorks is exhausting, not only that using dorks or platforms like bb
 since, you control the seed, you control the results you get and thus it solves the problem of - everyone getting well-known targets.
 
 If your dork query missed a company's bug bounty program to get it indexed on the search engine - there is a chance you may find it using ddork.
+
+## Demo
+
+<p align="center">
+  <img src="img/55329.jpg" alt="ddork demo" width="850" style="max-width: 100%; border-radius: 8px;" />
+</p>
 
 ### Key Capabilities
 
