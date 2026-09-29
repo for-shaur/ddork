@@ -12,7 +12,13 @@ import subprocess
 import sys
 
 from .colors import palette
-from .config import CLASSIFIER_GIT_URL, log
+from .config import (
+    CLASSIFIER_GIT_URL,
+    CLASSIFIER_PACKAGE,
+    DDORK_GIT_URL,
+    DDORK_PACKAGE,
+    log,
+)
 from .version import check_updates, is_outdated
 
 LOGO = r"""
@@ -70,31 +76,74 @@ def print_banner(verbose=1, show_tip=True):
 
     if d_info.get("outdated") or c_info.get("outdated"):
         print()
-        print(palette.muted("  run with --update to refresh the classifier"))
+        print(palette.muted("  run with --update to refresh ddork and isbounty"))
 
     print()
 
 
-def update_classifier():
-    """pip install --upgrade git+https://github.com/forshaur/isbounty."""
-    log.info(f"[UPD] installing classifier from git+{CLASSIFIER_GIT_URL}")
+def _run_pip_upgrade(pkg_name, target_spec):
+    """Run pip install --upgrade for a target with interactive console feedback."""
+    prefix = f"  {palette.neutral('[')}{palette.brand('*')}{palette.neutral(']')}"
+    print(f"{prefix} Updating {palette.bold(pkg_name)} ({target_spec})...", flush=True)
+    log.info(f"[UPD] upgrading {pkg_name} via {target_spec}")
+
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade",
-             f"git+{CLASSIFIER_GIT_URL}"],
-            capture_output=True, text=True, timeout=180,
+            [sys.executable, "-m", "pip", "install", "--upgrade", target_spec],
+            capture_output=True,
+            text=True,
+            timeout=180,
         )
     except subprocess.TimeoutExpired:
-        log.error("[UPD] pip install timed out after 180s")
+        err_prefix = f"  {palette.neutral('[')}{palette.error('!')}{palette.neutral(']')}"
+        print(f"{err_prefix} {palette.error(f'Failed to update {pkg_name}')}: pip install timed out after 180s", flush=True)
+        log.error(f"[UPD] pip install {pkg_name} timed out after 180s")
         return False
     except Exception as e:
-        log.error(f"[UPD] pip install failed: {e}")
+        err_prefix = f"  {palette.neutral('[')}{palette.error('!')}{palette.neutral(']')}"
+        print(f"{err_prefix} {palette.error(f'Failed to update {pkg_name}')}: {e}", flush=True)
+        log.error(f"[UPD] pip install {pkg_name} failed: {e}")
         return False
 
     if result.returncode != 0:
-        tail = (result.stderr or result.stdout or "")[-600:]
-        log.error(f"[UPD] pip install failed:\n{tail}")
+        err_prefix = f"  {palette.neutral('[')}{palette.error('!')}{palette.neutral(']')}"
+        print(f"{err_prefix} {palette.error(f'Failed to update {pkg_name}')} (exit code {result.returncode})", flush=True)
+        tail = (result.stderr or result.stdout or "").strip()
+        if tail:
+            tail_lines = tail.splitlines()[-10:]
+            for line in tail_lines:
+                print(f"      {palette.muted(line)}", flush=True)
+        log.error(f"[UPD] pip install {pkg_name} failed:\n{tail}")
         return False
 
-    log.info("[UPD] classifier updated")
+    ok_prefix = f"  {palette.neutral('[')}{palette.success('+')}{palette.neutral(']')}"
+    print(f"{ok_prefix} {palette.success(f'{pkg_name} updated successfully')}", flush=True)
+    log.info(f"[UPD] {pkg_name} updated successfully")
     return True
+
+
+def update_packages():
+    """Update ddork and the isbounty classifier via pip."""
+    targets = [
+        ("ddork", f"git+{DDORK_GIT_URL}" if DDORK_GIT_URL else DDORK_PACKAGE),
+        ("isbounty", f"git+{CLASSIFIER_GIT_URL}" if CLASSIFIER_GIT_URL else CLASSIFIER_PACKAGE),
+    ]
+
+    print(f"\n{palette.bold('Updating ddork and isbounty classifier...')}\n", flush=True)
+
+    success_all = True
+    for name, target in targets:
+        if not _run_pip_upgrade(name, target):
+            success_all = False
+
+    print()
+    if success_all:
+        print(f"  {palette.neutral('[')}{palette.success('+')}{palette.neutral(']')} {palette.bold('All packages are up to date.')}\n", flush=True)
+    else:
+        print(f"  {palette.neutral('[')}{palette.error('!')}{palette.neutral(']')} {palette.bold('One or more updates failed. Check logs in scan.log.')}\n", flush=True)
+
+    return success_all
+
+
+# Backwards compatibility alias
+update_classifier = update_packages

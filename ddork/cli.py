@@ -43,7 +43,7 @@ def build_parser():
     p.add_argument("--debug", action="store_true",
                    help="alias for -v 3")
     p.add_argument("--update", action="store_true",
-                   help="update the isbounty classifier via pip and exit")
+                   help="update ddork and the isbounty classifier via pip and exit")
     p.add_argument("--no-banner", action="store_true",
                    help="skip the startup banner (logo + version lines)")
     p.add_argument("--no-tips", action="store_true",
@@ -61,11 +61,10 @@ async def main():
     verbose = 3 if args.debug else args.verbose
     configure_logging(verbose)
 
-    # --update short-circuits everything else — it exists precisely to fix
-    # a missing classifier, so it must not require one.
+    # --update short-circuits everything else — updates ddork & isbounty via pip.
     if args.update:
-        from .banner import update_classifier
-        return 0 if update_classifier() else 1
+        from .banner import update_packages
+        return 0 if update_packages() else 1
 
     label_filter = None
     if args.o and len(args.o) > 2:
