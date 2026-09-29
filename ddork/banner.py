@@ -44,17 +44,40 @@ def _tag(installed, latest, error):
     return _parens(palette.success("latest"))
 
 
-def print_banner(verbose=1, show_tip=True):
+def print_logo():
+    """Print just the ASCII logo immediately, without any network or version checking."""
+    print(palette.brand(LOGO.rstrip("\n")), flush=True)
+    print(flush=True)
+
+
+def print_banner(verbose=1, show_tip=True, skip_logo=False):
     """Print the logo, version lines, and tip. Silenced by -v 0."""
     if verbose < 1:
         return
 
-    from . import __version__ as ddork_ver
+    # Print logo immediately so the user doesn't face a blank frozen terminal
+    if not skip_logo:
+        print_logo()
 
+    # Give immediate feedback that ddork is active and checking for updates
+    is_tty = False
+    try:
+        is_tty = bool(sys.stdout.isatty())
+    except Exception:
+        pass
+
+    if is_tty:
+        status_msg = f"  {palette.muted('checking for updates...')}"
+        sys.stdout.write(status_msg)
+        sys.stdout.flush()
+
+    from . import __version__ as ddork_ver
     d_info, c_info = check_updates()
 
-    print(palette.brand(LOGO.rstrip("\n")))
-    print()
+    if is_tty:
+        # Clear status message line cleanly on interactive terminals
+        sys.stdout.write("\r\x1b[2K")
+        sys.stdout.flush()
 
     d_tag = _tag(ddork_ver, d_info.get("latest"), d_info.get("error"))
     d_line = f"  {palette.bold('ddork')}    {palette.success(ddork_ver)}"
@@ -78,7 +101,7 @@ def print_banner(verbose=1, show_tip=True):
         print()
         print(palette.muted("  run with --update to refresh ddork and isbounty"))
 
-    print()
+    print(flush=True)
 
 
 def _run_pip_upgrade(pkg_name, target_spec):

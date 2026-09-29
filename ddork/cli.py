@@ -1,14 +1,9 @@
 """Command-line entry point."""
 import argparse
-import asyncio as aio
+import sys
 
-from .analyzer import run_workflow
-from .classifier import classifier, print_preflight_error
-from .competitors.enumerate import enumerate_domains
 from .config import configure_logging, log
-from .net import normalize_domain
-from .report import LABELS, print_report, save_urls
-from .ui import ScanUI
+from .report import LABELS
 
 
 def build_parser():
@@ -56,7 +51,7 @@ def build_parser():
     return p
 
 
-async def main():
+async def main(logo_already_printed=False):
     args = build_parser().parse_args()
     verbose = 3 if args.debug else args.verbose
     configure_logging(verbose)
@@ -84,23 +79,26 @@ async def main():
     # error that follows.
     if verbose >= 1 and not args.no_banner:
         from .banner import print_banner
-        print_banner(verbose, show_tip=not args.no_tips)
+        print_banner(verbose, show_tip=not args.no_tips, skip_logo=logo_already_printed)
 
     # Classifier preflight. Skip it in --enumerate-only mode: enumeration
     # does not need isbounty. Everything else does, so fail here with an
     # actionable message instead of deep inside the async workflow.
     if not args.enumerate_only:
+        from .classifier import classifier, print_preflight_error
         ok, reason, _ = classifier.preflight()
         if not ok:
             print_preflight_error(reason)
             return 2
 
+    from .ui import ScanUI
     ui = ScanUI(verbose) if 1 <= verbose <= 2 else None
     if ui:
         ui.__enter__()
 
     store = None
     try:
+        from .net import normalize_domain
         if args.f:
             with open(args.f, encoding="utf-8") as fh:
                 domains = [normalize_domain(l.strip()) for l in fh if l.strip()]
@@ -112,6 +110,7 @@ async def main():
                 )
             if ui:
                 ui.checkpoint(f"seeding from {args.u}, target {args.min_targets}")
+            from .competitors.enumerate import enumerate_domains
             domains = enumerate_domains(
                 args.u, args.min_targets, args.w, args.delay, ui=ui
             )
@@ -132,6 +131,7 @@ async def main():
             log.info(f"Enumerated {len(domains)} targets, saved to {args.enumerate_only}")
             return
 
+        from .analyzer import run_workflow
         results = await run_workflow(domains, args.w, ui=ui)
 
         if args.store:
@@ -146,6 +146,7 @@ async def main():
         if store:
             store.close()
 
+    from .report import print_report, save_urls
     print_report(results, show_all=args.all)
 
     if args.o:
@@ -165,4 +166,17 @@ async def main():
 
 
 def run():
-    aio.run(main())
+    import asyncio as aio
+
+    # Check early CLI args to print the logo instantly (sub-millisecond)
+    argv = sys.argv[1:]
+    wants_help = any(a in ("-h", "--help") for a in argv)
+    wants_quiet = any(a in ("-v0", "--no-banner") or a == "0" for a in argv)
+    
+    logo_already_printed = False
+    if not wants_help and not wants_quiet:
+        from .banner import print_logo
+        print_logo()
+        logo_already_printed = True
+
+    aio.run(main(logo_already_printed=logo_already_printed))
