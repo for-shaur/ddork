@@ -46,6 +46,8 @@ def build_parser():
                    help="update the isbounty classifier via pip and exit")
     p.add_argument("--no-banner", action="store_true",
                    help="skip the startup banner (logo + version lines)")
+    p.add_argument("--no-tips", action="store_true",
+                   help="skip the helpful tip shown at the end of a run")
     p.add_argument(
         "--enumerate-only", nargs="?", const="targets.txt", default=None, metavar="FILE",
         help="stop after enumeration, save discovered domains to FILE and exit. "
@@ -83,7 +85,7 @@ async def main():
     # error that follows.
     if verbose >= 1 and not args.no_banner:
         from .banner import print_banner
-        print_banner(verbose)
+        print_banner(verbose, show_tip=not args.no_tips)
 
     # Classifier preflight. Skip it in --enumerate-only mode: enumeration
     # does not need isbounty. Everything else does, so fail here with an

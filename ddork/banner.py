@@ -38,8 +38,8 @@ def _tag(installed, latest, error):
     return _parens(palette.success("latest"))
 
 
-def print_banner(verbose=1):
-    """Print the logo and version lines. Silenced by -v 0."""
+def print_banner(verbose=1, show_tip=True):
+    """Print the logo, version lines, and tip. Silenced by -v 0."""
     if verbose < 1:
         return
 
@@ -63,6 +63,10 @@ def print_banner(verbose=1):
     if c_tag:
         c_line += f" {c_tag}"
     print(c_line)
+
+    if show_tip:
+        from .tips import print_tip
+        print_tip()
 
     if d_info.get("outdated") or c_info.get("outdated"):
         print()
